@@ -1,0 +1,53 @@
+name: Build a Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: 'Release name (e.g. "lxd-4.0.3")'
+        default: 'lxd-4.0.3'
+        required: true
+
+jobs:
+  build:
+    name: Build ${{ github.event.inputs.release_name }} for ${{ matrix.os }} 
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-20.04]
+
+    steps:
+    - name: Set up Go
+      uses: actions/setup-go@v2
+      with:
+        go-version: ^1.13
+      id: go
+
+    - name: Fetch release
+      env:
+        TARBALL_URL: https://linuxcontainers.org/downloads/lxd/${{ github.event.inputs.release_name }}.tar.gz
+      run: |
+        curl --fail --show-error --silent --location --output lxd.tar.gz $TARBALL_URL
+        curl --fail --show-error --silent --location --output lxd.tar.gz.asc $TARBALL_URL.asc
+        
+    - name: Verify release signature
+      # signing key IDs via https://discuss.linuxcontainers.org/t/why-is-there-no-go-sum-file-or-vendors-directory-in-the-distrobuilder-source/8625/4
+      run: |
+        gpg --recv-keys 0xC638974D64792D67
+        gpg --recv-keys 0x7B3C391EFEA93624
+        gpg --verify lxd.tar.gz.asc lxd.tar.gz
+        tar -xzf lxd.tar.gz
+        mv ${{ github.event.inputs.release_name }} lxd
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y acl autoconf dnsmasq-base libacl1-dev libcap-dev liblxc1 liblxc-dev libsqlite3-dev libtool libudev-dev libuv1-dev make pkg-config rsync squashfs-tools tar tcl xz-utils ebtables
+
+    - name: Build
+      env:
+        GOPATH: $(pwd)/lxd/_dist
+      run: |
+        echo GOPATH is set to "$GOPATH"
+        cd lxd
+        make deps
