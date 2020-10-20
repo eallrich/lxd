@@ -44,9 +44,16 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y acl autoconf dnsmasq-base libacl1-dev libcap-dev liblxc1 liblxc-dev libsqlite3-dev libtool libudev-dev libuv1-dev make pkg-config rsync squashfs-tools tar tcl xz-utils ebtables
 
-    - name: Build
+    - name: Make deps
       run: |
         export GOPATH=$(pwd)/lxd/_dist
-        echo GOPATH is set to "$GOPATH"
         cd lxd
         make deps
+        make deps | grep '^export ' > $HOME/build-env
+        
+    - name: Make
+      run: |
+        export GOPATH=$(pwd)/lxd/_dist
+        cd lxd
+        source $HOME/build-env
+        make
