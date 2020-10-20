@@ -56,4 +56,6 @@ jobs:
         export GOPATH=$(pwd)/lxd/_dist
         cd lxd
         source $HOME/build-env
+        cat $HOME/build-env
+        env
         make
