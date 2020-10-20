@@ -55,8 +55,15 @@ jobs:
       run: |
         export GOPATH=$(pwd)/lxd/_dist
         export GOBIN=$GOPATH/bin
-        cd lxd
         source $HOME/build-env
-        cat $HOME/build-env
-        env
+        cd lxd
         make
+        
+    - name: Archive
+      run: tar -czf ${{ github.event.inputs.release_name }}_${{ matrix.os }}.tar.gz lxd/
+
+    - name: Upload
+      uses: actions/upload-artifact@v2
+      with:
+        name: ${{ github.event.inputs.release_name }}_${{ matrix.os }}
+        path: ${{ github.event.inputs.release_name }}_${{ matrix.os }}.tar.gz  
