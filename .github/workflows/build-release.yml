@@ -54,6 +54,7 @@ jobs:
     - name: Make
       run: |
         export GOPATH=$(pwd)/lxd/_dist
+        export GOBIN=$GOPATH/bin
         cd lxd
         source $HOME/build-env
         cat $HOME/build-env
