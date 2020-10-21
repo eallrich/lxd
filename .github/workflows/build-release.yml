@@ -30,11 +30,18 @@ jobs:
         curl --fail --show-error --silent --location --output lxd.tar.gz $TARBALL_URL
         curl --fail --show-error --silent --location --output lxd.tar.gz.asc $TARBALL_URL.asc
         
-    - name: Verify release signature
+    - name: Fetch key signatures
       # signing key IDs via https://discuss.linuxcontainers.org/t/why-is-there-no-go-sum-file-or-vendors-directory-in-the-distrobuilder-source/8625/4
+      if: ${{ maatrix.os != 'ubuntu-18.04' }}
+      run: gpg --recv-keys 0xC638974D64792D67 0x7B3C391EFEA93624
+        
+    - name: Fetch key signatures (bionic)
+      if: ${{ matrix.os == 'ubuntu-18.04' }}
       run: |
-        gpg --recv-keys 0xC638974D64792D67
-        gpg --recv-keys 0x7B3C391EFEA93624
+        gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 0xC638974D64792D67 0x7B3C391EFEA93624
+        
+    - name: Verify release signature
+      run: |
         gpg --verify lxd.tar.gz.asc lxd.tar.gz
         tar -xzf lxd.tar.gz
         mv ${{ github.event.inputs.release_name }} lxd
