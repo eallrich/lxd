@@ -32,7 +32,7 @@ jobs:
         
     - name: Fetch key signatures
       # signing key IDs via https://discuss.linuxcontainers.org/t/why-is-there-no-go-sum-file-or-vendors-directory-in-the-distrobuilder-source/8625/4
-      if: ${{ maatrix.os != 'ubuntu-18.04' }}
+      if: ${{ matrix.os != 'ubuntu-18.04' }}
       run: gpg --recv-keys 0xC638974D64792D67 0x7B3C391EFEA93624
         
     - name: Fetch key signatures (bionic)
