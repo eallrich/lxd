@@ -68,7 +68,7 @@ jobs:
         
     - name: Customize
       run: |
-        grep LD_LIBRARY_PATH $HOME/build-env | sed -e "s@$(pwd)/lxd/_dist@\${GOPATH}@g" -e 's/$/:${LD_LIBRARY_PATH}/'
+        grep LD_LIBRARY_PATH $HOME/build-env | sed -e "s@$(pwd)/lxd/_dist@\${GOPATH}@g" -e 's/"$/:${LD_LIBRARY_PATH}"/'
         
     - name: Archive
       run: tar -czf ${{ github.event.inputs.release_name }}_${{ matrix.os }}.tar.gz lxd/
