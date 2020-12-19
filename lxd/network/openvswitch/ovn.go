@@ -44,6 +44,9 @@ const OVNIPv6AddressModeDHCPStateful OVNIPv6AddressMode = "dhcpv6_stateful"
 // OVNIPv6AddressModeDHCPStateless IPv6 DHCPv6 stateless mode.
 const OVNIPv6AddressModeDHCPStateless OVNIPv6AddressMode = "dhcpv6_stateless"
 
+// ErrOVNNoPortIPs used when no IPs are found for a logical port.
+var ErrOVNNoPortIPs = fmt.Errorf("No port IPs")
+
 // OVNIPv6RAOpts IPv6 router advertisements options that can be applied to a router.
 type OVNIPv6RAOpts struct {
 	SendPeriodic       bool
@@ -322,7 +325,7 @@ func (o *OVN) LogicalSwitchDelete(switchName OVNSwitch) error {
 		return err
 	}
 
-	err = o.logicalSwitchDHCPOptionsDelete(switchName)
+	err = o.LogicalSwitchDHCPOptionsDelete(switchName)
 	if err != nil {
 		return err
 	}
@@ -546,8 +549,9 @@ func (o *OVN) LogicalSwitchDHCPOptionsGet(switchName OVNSwitch) ([]OVNDHCPOptsSe
 	return dhcpOpts, nil
 }
 
-// logicalSwitchDHCPOptionsDelete deletes any DHCP options defined for a switch.
-func (o *OVN) logicalSwitchDHCPOptionsDelete(switchName OVNSwitch) error {
+// LogicalSwitchDHCPOptionsDelete deletes any DHCP options defined for a switch.
+// Optionally accepts one or more specific UUID records to delete (if they are associated to the specified switch).
+func (o *OVN) LogicalSwitchDHCPOptionsDelete(switchName OVNSwitch, onlyUUID ...string) error {
 	existingOpts, err := o.nbctl("--format=csv", "--no-headings", "--data=bare", "--colum=_uuid", "find", "dhcp_options",
 		fmt.Sprintf("external_ids:lxd_switch=%s", string(switchName)),
 	)
@@ -555,12 +559,28 @@ func (o *OVN) logicalSwitchDHCPOptionsDelete(switchName OVNSwitch) error {
 		return err
 	}
 
+	shouldDelete := func(existingUUID string) bool {
+		if len(onlyUUID) <= 0 {
+			return true // Delete all records if no UUID filter supplied.
+		}
+
+		for _, uuid := range onlyUUID {
+			if existingUUID == uuid {
+				return true
+			}
+		}
+
+		return false
+	}
+
 	existingOpts = strings.TrimSpace(existingOpts)
 	if existingOpts != "" {
 		for _, uuid := range strings.Split(existingOpts, "\n") {
-			_, err = o.nbctl("destroy", "dhcp_options", uuid)
-			if err != nil {
-				return err
+			if shouldDelete(uuid) {
+				_, err = o.nbctl("destroy", "dhcp_options", uuid)
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -750,6 +770,10 @@ func (o *OVN) LogicalSwitchPortSetDNS(switchName OVNSwitch, portName OVNSwitchPo
 
 	if dnsIPv6 != nil {
 		dnsIPs = append(dnsIPs, dnsIPv6.String())
+	}
+
+	if len(dnsIPs) <= 0 {
+		return "", nil, nil, ErrOVNNoPortIPs
 	}
 
 	// Check if existing DNS record exists for switch port.

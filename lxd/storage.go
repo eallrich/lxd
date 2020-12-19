@@ -15,6 +15,7 @@ import (
 	storageDrivers "github.com/lxc/lxd/lxd/storage/drivers"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/idmap"
+	log "github.com/lxc/lxd/shared/log15"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/version"
 )
@@ -55,6 +56,7 @@ func resetContainerDiskIdmap(container instance.Container, srcIdmap *idmap.Idmap
 			jsonIdmap = "[]"
 		}
 
+		logger.Debug("Setting new volatile.last_state.idmap from source instance", log.Ctx{"project": container.Project(), "instance": container.Name(), "sourceIdmap": srcIdmap})
 		err := container.VolatileSet(map[string]string{"volatile.last_state.idmap": jsonIdmap})
 		if err != nil {
 			return err
@@ -65,7 +67,7 @@ func resetContainerDiskIdmap(container instance.Container, srcIdmap *idmap.Idmap
 }
 
 func setupStorageDriver(s *state.State, forceCheck bool) error {
-	pools, err := s.Cluster.GetNonPendingStoragePoolNames()
+	pools, err := s.Cluster.GetCreatedStoragePoolNames()
 	if err != nil {
 		if err == db.ErrNoSuchObject {
 			logger.Debugf("No existing storage pools detected")

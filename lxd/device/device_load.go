@@ -52,10 +52,15 @@ func load(inst instance.Instance, state *state.State, projectName string, name s
 		case "sriov":
 			dev = &infinibandSRIOV{}
 		}
+	case "gpu":
+		switch conf["gputype"] {
+		case "mdev":
+			dev = &gpuMdev{}
+		default:
+			dev = &gpuPhysical{}
+		}
 	case "proxy":
 		dev = &proxy{}
-	case "gpu":
-		dev = &gpu{}
 	case "usb":
 		dev = &usb{}
 	case "unix-char", "unix-block":
@@ -66,6 +71,8 @@ func load(inst instance.Instance, state *state.State, projectName string, name s
 		dev = &disk{}
 	case "none":
 		dev = &none{}
+	case "tpm":
+		dev = &tpm{}
 	}
 
 	// Check a valid device type has been found.

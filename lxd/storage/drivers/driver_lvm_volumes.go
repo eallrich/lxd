@@ -188,7 +188,7 @@ func (d *lvm) DeleteVolume(vol Volume, op *operations.Operation) error {
 
 	if lvExists {
 		if vol.contentType == ContentTypeFS {
-			_, err = d.UnmountVolume(vol, op)
+			_, err = d.UnmountVolume(vol, false, op)
 			if err != nil {
 				return errors.Wrapf(err, "Error unmounting LVM logical volume")
 			}
@@ -239,6 +239,37 @@ func (d *lvm) HasVolume(vol Volume) bool {
 	return volExists
 }
 
+// FillVolumeConfig populate volume with default config.
+func (d *lvm) FillVolumeConfig(vol Volume) error {
+	// Only validate filesystem config keys for filesystem volumes or VM block volumes (which have an
+	// associated filesystem volume).
+	if vol.ContentType() == ContentTypeFS || vol.IsVMBlock() {
+		// Inherit filesystem from pool if not set.
+		if vol.config["block.filesystem"] == "" {
+			vol.config["block.filesystem"] = d.config["volume.block.filesystem"]
+		}
+
+		// Default filesystem if neither volume nor pool specify an override.
+		if vol.config["block.filesystem"] == "" {
+			// Unchangeable volume property: Set unconditionally.
+			vol.config["block.filesystem"] = DefaultFilesystem
+		}
+
+		// Inherit filesystem mount options from pool if not set.
+		if vol.config["block.mount_options"] == "" {
+			vol.config["block.mount_options"] = d.config["volume.block.mount_options"]
+		}
+
+		// Default filesystem mount options if neither volume nor pool specify an override.
+		if vol.config["block.mount_options"] == "" {
+			// Unchangeable volume property: Set unconditionally.
+			vol.config["block.mount_options"] = "discard"
+		}
+	}
+
+	return nil
+}
+
 // ValidateVolume validates the supplied volume config.
 func (d *lvm) ValidateVolume(vol Volume, removeUnknownKeys bool) error {
 	rules := map[string]func(value string) error{
@@ -270,8 +301,9 @@ func (d *lvm) ValidateVolume(vol Volume, removeUnknownKeys bool) error {
 
 // UpdateVolume applies config changes to the volume.
 func (d *lvm) UpdateVolume(vol Volume, changedConfig map[string]string) error {
-	if _, changed := changedConfig["size"]; changed {
-		err := d.SetVolumeQuota(vol, changedConfig["size"], nil)
+	newSize, sizeChanged := changedConfig["size"]
+	if sizeChanged {
+		err := d.SetVolumeQuota(vol, newSize, nil)
 		if err != nil {
 			return err
 		}
@@ -370,42 +402,63 @@ func (d *lvm) SetVolumeQuota(vol Volume, size string, op *operations.Operation) 
 		defer d.deactivateVolume(volDevPath)
 	}
 
+	inUse := vol.MountInUse()
+
 	// Resize filesystem if needed.
 	if vol.contentType == ContentTypeFS {
+		fsType := vol.ConfigBlockFilesystem()
+
 		if sizeBytes < oldSizeBytes {
-			// Shrink filesystem to new size first, then shrink logical volume.
-			err = shrinkFileSystem(vol.ConfigBlockFilesystem(), volDevPath, vol, sizeBytes)
+			if !filesystemTypeCanBeShrunk(fsType) {
+				return errors.Wrapf(ErrCannotBeShrunk, "Filesystem %q cannot be shrunk", fsType)
+			}
+
+			if inUse {
+				return ErrInUse // We don't allow online shrinking of filesytem volumes.
+			}
+
+			// Shrink filesystem first.
+			err = shrinkFileSystem(fsType, volDevPath, vol, sizeBytes)
 			if err != nil {
 				return err
 			}
 			d.logger.Debug("Logical volume filesystem shrunk", logCtx)
 
+			// Shrink the block device.
 			err = d.resizeLogicalVolume(volDevPath, sizeBytes)
 			if err != nil {
 				return err
 			}
 		} else if sizeBytes > oldSizeBytes {
-			// Grow logical volume to new size first, then grow filesystem to fill it.
+			// Grow block device first.
 			err = d.resizeLogicalVolume(volDevPath, sizeBytes)
 			if err != nil {
 				return err
 			}
 
-			err = growFileSystem(vol.ConfigBlockFilesystem(), volDevPath, vol)
+			// Grow the filesystem to fill block device.
+			err = growFileSystem(fsType, volDevPath, vol)
 			if err != nil {
 				return err
 			}
 			d.logger.Debug("Logical volume filesystem grown", logCtx)
 		}
 	} else {
-		if sizeBytes < oldSizeBytes && !vol.allowUnsafeResize {
-			return errors.Wrap(ErrCannotBeShrunk, "You cannot shrink block volumes")
+		// Only perform pre-resize sanity checks if we are not in "unsafe" mode.
+		// In unsafe mode we expect the caller to know what they are doing and understand the risks.
+		if !vol.allowUnsafeResize {
+			if sizeBytes < oldSizeBytes {
+				return errors.Wrap(ErrCannotBeShrunk, "Block volumes cannot be shrunk")
+			}
+
+			if inUse {
+				return ErrInUse // We don't allow online resizing of block volumes.
+			}
 		}
 
 		err = d.resizeLogicalVolume(volDevPath, sizeBytes)
 		if err != nil {
 			return err
-
 		}
 
 		// Move the VM GPT alt header to end of disk if needed (not needed in unsafe resize mode as it is
@@ -431,84 +484,119 @@ func (d *lvm) GetVolumeDiskPath(vol Volume) (string, error) {
 	return "", ErrNotSupported
 }
 
-// MountVolume mounts a volume. Returns true if this volume was our mount.
-func (d *lvm) MountVolume(vol Volume, op *operations.Operation) (bool, error) {
-	var err error
-	activated := false
+// MountVolume mounts a volume and increments ref counter. Please call UnmountVolume() when done with the volume.
+func (d *lvm) MountVolume(vol Volume, op *operations.Operation) error {
+	unlock := vol.MountLock()
+	defer unlock()
+
+	revert := revert.New()
+	defer revert.Fail()
 
 	// Activate LVM volume if needed.
 	volDevPath := d.lvmDevPath(d.config["lvm.vg_name"], vol.volType, vol.contentType, vol.name)
-	activated, err = d.activateVolume(volDevPath)
+	activated, err := d.activateVolume(volDevPath)
 	if err != nil {
-		return false, err
+		return err
+	}
+	if activated {
+		revert.Add(func() { d.deactivateVolume(volDevPath) })
 	}
 
-	// Check if already mounted.
-	mountPath := vol.MountPath()
-	if vol.contentType == ContentTypeFS && !shared.IsMountPoint(mountPath) {
-		err = vol.EnsureMountPath()
-		if err != nil {
-			return false, err
+	if vol.contentType == ContentTypeFS {
+		// Check if already mounted.
+		mountPath := vol.MountPath()
+		if !shared.IsMountPoint(mountPath) {
+			err = vol.EnsureMountPath()
+			if err != nil {
+				return err
+			}
+
+			mountFlags, mountOptions := resolveMountOptions(vol.ConfigBlockMountOptions())
+			err = TryMount(volDevPath, mountPath, vol.ConfigBlockFilesystem(), mountFlags, mountOptions)
+			if err != nil {
+				return errors.Wrapf(err, "Failed to mount LVM logical volume")
+			}
+			d.logger.Debug("Mounted logical volume", log.Ctx{"dev": volDevPath, "path": mountPath, "options": mountOptions})
 		}
-
-		mountFlags, mountOptions := resolveMountOptions(vol.ConfigBlockMountOptions())
-		err = TryMount(volDevPath, mountPath, vol.ConfigBlockFilesystem(), mountFlags, mountOptions)
-		if err != nil {
-			return false, errors.Wrapf(err, "Failed to mount LVM logical volume")
+	} else if vol.contentType == ContentTypeBlock {
+		// For VMs, mount the filesystem volume.
+		if vol.IsVMBlock() {
+			fsVol := vol.NewVMBlockFilesystemVolume()
+			err = d.MountVolume(fsVol, op)
+			if err != nil {
+				return err
+			}
 		}
-		d.logger.Debug("Mounted logical volume", log.Ctx{"dev": volDevPath, "path": mountPath, "options": mountOptions})
-
-		return true, nil
 	}
 
-	// For VMs, mount the filesystem volume.
-	if vol.IsVMBlock() {
-		fsVol := vol.NewVMBlockFilesystemVolume()
-		return d.MountVolume(fsVol, op)
-	}
-
-	return activated, nil
+	vol.MountRefCountIncrement() // From here on it is up to caller to call UnmountVolume() when done.
+	revert.Success()
+	return nil
 }
 
-// UnmountVolume unmounts a volume. Returns true if we unmounted.
-func (d *lvm) UnmountVolume(vol Volume, op *operations.Operation) (bool, error) {
+// UnmountVolume unmounts volume if mounted and not in use. Returns true if this unmounted the volume.
+// keepBlockDev indicates if backing block device should be not be deactivated when volume is unmounted.
+func (d *lvm) UnmountVolume(vol Volume, keepBlockDev bool, op *operations.Operation) (bool, error) {
+	unlock := vol.MountLock()
+	defer unlock()
+
 	var err error
+	ourUnmount := false
 	volDevPath := d.lvmDevPath(d.config["lvm.vg_name"], vol.volType, vol.contentType, vol.name)
-	mountPath := vol.MountPath()
+	refCount := vol.MountRefCountDecrement()
 
 	// Check if already mounted.
-	if vol.contentType == ContentTypeFS && shared.IsMountPoint(mountPath) {
-		err = TryUnmount(mountPath, 0)
-		if err != nil {
-			return false, errors.Wrapf(err, "Failed to unmount LVM logical volume")
-		}
-		d.logger.Debug("Unmounted logical volume", log.Ctx{"path": mountPath})
+	if vol.contentType == ContentTypeFS {
+		mountPath := vol.MountPath()
+		if shared.IsMountPoint(mountPath) {
+			if refCount > 0 {
+				d.logger.Debug("Skipping unmount as in use", "refCount", refCount)
+				return false, ErrInUse
+			}
 
-		// We only deactivate filesystem volumes if an unmount was needed to better align with our
-		// unmount return value indicator.
-		_, err = d.deactivateVolume(volDevPath)
-		if err != nil {
-			return false, err
+			err = TryUnmount(mountPath, 0)
+			if err != nil {
+				return false, errors.Wrapf(err, "Failed to unmount LVM logical volume")
+			}
+			d.logger.Debug("Unmounted logical volume", log.Ctx{"path": mountPath, "keepBlockDev": keepBlockDev})
+
+			// We only deactivate filesystem volumes if an unmount was needed to better align with our
+			// unmount return value indicator.
+			if !keepBlockDev {
+				_, err = d.deactivateVolume(volDevPath)
+				if err != nil {
+					return false, err
+				}
+			}
+
+			ourUnmount = true
+		}
+	} else if vol.contentType == ContentTypeBlock {
+		// For VMs, unmount the filesystem volume.
+		if vol.IsVMBlock() {
+			fsVol := vol.NewVMBlockFilesystemVolume()
+			_, err = d.UnmountVolume(fsVol, false, op)
+			if err != nil {
+				return false, err
+			}
 		}
 
-		return true, nil
+		if !keepBlockDev && shared.PathExists(volDevPath) {
+			if refCount > 0 {
+				d.logger.Debug("Skipping unmount as in use", "refCount", refCount)
+				return false, ErrInUse
+			}
+
+			_, err = d.deactivateVolume(volDevPath)
+			if err != nil {
+				return false, err
+			}
+
+			ourUnmount = true
+		}
 	}
 
-	deactivated := false
-	if vol.contentType == ContentTypeBlock {
-		deactivated, err = d.deactivateVolume(volDevPath)
-		if err != nil {
-			return false, err
-		}
-	}
-
-	// For VMs, unmount the filesystem volume.
-	if vol.IsVMBlock() {
-		fsVol := vol.NewVMBlockFilesystemVolume()
-		return d.UnmountVolume(fsVol, op)
-	}
-
-	return deactivated, nil
+	return ourUnmount, nil
 }
 
 // RenameVolume renames a volume and its snapshots.
@@ -580,7 +668,7 @@ func (d *lvm) RenameVolume(vol Volume, newVolName string, op *operations.Operati
 
 		revert.Success()
 		return nil
-	}, op)
+	}, false, op)
 }
 
 // MigrateVolume sends a volume for migration.
@@ -664,7 +752,7 @@ func (d *lvm) DeleteVolumeSnapshot(snapVol Volume, op *operations.Operation) err
 	}
 
 	if lvExists {
-		_, err = d.UnmountVolume(snapVol, op)
+		_, err = d.UnmountVolume(snapVol, false, op)
 		if err != nil {
 			return errors.Wrapf(err, "Error unmounting LVM logical volume")
 		}
@@ -703,6 +791,9 @@ func (d *lvm) DeleteVolumeSnapshot(snapVol Volume, op *operations.Operation) err
 
 // MountVolumeSnapshot sets up a read-only mount on top of the snapshot to avoid accidental modifications.
 func (d *lvm) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) (bool, error) {
+	unlock := snapVol.MountLock()
+	defer unlock()
+
 	var err error
 	mountPath := snapVol.MountPath()
 
@@ -810,6 +901,9 @@ func (d *lvm) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) (boo
 // UnmountVolumeSnapshot removes the read-only mount placed on top of a snapshot.
 // If a temporary snapshot volume exists then it will attempt to remove it.
 func (d *lvm) UnmountVolumeSnapshot(snapVol Volume, op *operations.Operation) (bool, error) {
+	unlock := snapVol.MountLock()
+	defer unlock()
+
 	var err error
 	volDevPath := d.lvmDevPath(d.config["lvm.vg_name"], snapVol.volType, snapVol.contentType, snapVol.name)
 	mountPath := snapVol.MountPath()
@@ -926,7 +1020,7 @@ func (d *lvm) RestoreVolume(vol Volume, snapshotName string, op *operations.Oper
 	// 2. Create a writable snapshot with the original name from the snapshot being restored.
 	// 3. Delete the renamed original volume.
 	if d.usesThinpool() {
-		_, err = d.UnmountVolume(vol, op)
+		_, err = d.UnmountVolume(vol, false, op)
 		if err != nil {
 			return errors.Wrapf(err, "Error unmounting LVM logical volume")
 		}

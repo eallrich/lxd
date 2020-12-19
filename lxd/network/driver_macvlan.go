@@ -1,9 +1,7 @@
 package network
 
 import (
-	"fmt"
-
-	"github.com/lxc/lxd/lxd/cluster"
+	"github.com/lxc/lxd/lxd/cluster/request"
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/shared/api"
@@ -45,8 +43,9 @@ func (n *macvlan) Validate(config map[string]string) error {
 }
 
 // Delete deletes a network.
-func (n *macvlan) Delete(clientType cluster.ClientType) error {
+func (n *macvlan) Delete(clientType request.ClientType) error {
 	n.logger.Debug("Delete", log.Ctx{"clientType": clientType})
+
 	return n.common.delete(clientType)
 }
 
@@ -67,10 +66,6 @@ func (n *macvlan) Rename(newName string) error {
 func (n *macvlan) Start() error {
 	n.logger.Debug("Start")
 
-	if n.status == api.NetworkStatusPending {
-		return fmt.Errorf("Cannot start pending network")
-	}
-
 	return nil
 }
 
@@ -83,7 +78,7 @@ func (n *macvlan) Stop() error {
 
 // Update updates the network. Accepts notification boolean indicating if this update request is coming from a
 // cluster notification, in which case do not update the database, just apply local changes needed.
-func (n *macvlan) Update(newNetwork api.NetworkPut, targetNode string, clientType cluster.ClientType) error {
+func (n *macvlan) Update(newNetwork api.NetworkPut, targetNode string, clientType request.ClientType) error {
 	n.logger.Debug("Update", log.Ctx{"clientType": clientType, "newNetwork": newNetwork})
 
 	dbUpdateNeeeded, _, oldNetwork, err := n.common.configChanged(newNetwork)
@@ -93,6 +88,13 @@ func (n *macvlan) Update(newNetwork api.NetworkPut, targetNode string, clientTyp
 
 	if !dbUpdateNeeeded {
 		return nil // Nothing changed.
+	}
+
+	// If the network as a whole has not had any previous creation attempts, or the node itself is still
+	// pending, then don't apply the new settings to the node, just to the database record (ready for the
+	// actual global create request to be initiated).
+	if n.Status() == api.NetworkStatusPending || n.LocalStatus() == api.NetworkStatusPending {
+		return n.common.update(newNetwork, targetNode, clientType)
 	}
 
 	revert := revert.New()

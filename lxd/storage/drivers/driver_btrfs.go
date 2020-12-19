@@ -80,8 +80,7 @@ func (d *btrfs) Info() Info {
 		Remote:                d.isRemote(),
 		VolumeTypes:           []VolumeType{VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
 		BlockBacking:          false,
-		RunningQuotaResize:    true,
-		RunningSnapshotFreeze: false,
+		RunningCopyFreeze:     false,
 		DirectIO:              true,
 		MountedRoot:           true,
 	}

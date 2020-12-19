@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
@@ -19,6 +21,7 @@ import (
 	"github.com/lxc/lxd/lxd/db"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
+	"github.com/lxc/lxd/lxd/instance/drivers"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/project"
@@ -39,7 +42,7 @@ func instanceCreateAsEmpty(d *Daemon, args db.InstanceArgs) (instance.Instance, 
 	// Create the instance record.
 	inst, err := instanceCreateInternal(d.State(), args)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "Failed creating instance record")
 	}
 
 	revert := true
@@ -48,7 +51,7 @@ func instanceCreateAsEmpty(d *Daemon, args db.InstanceArgs) (instance.Instance, 
 			return
 		}
 
-		inst.Delete()
+		inst.Delete(true)
 	}()
 
 	pool, err := storagePools.GetPoolByInstance(d.State(), inst)
@@ -61,8 +64,7 @@ func instanceCreateAsEmpty(d *Daemon, args db.InstanceArgs) (instance.Instance, 
 		return nil, errors.Wrap(err, "Create instance")
 	}
 
-	// Apply any post-storage configuration.
-	err = instanceConfigureInternal(d.State(), inst)
+	err = inst.UpdateBackupFile()
 	if err != nil {
 		return nil, err
 	}
@@ -147,17 +149,12 @@ func instanceCreateFromImage(d *Daemon, args db.InstanceArgs, hash string, op *o
 	// Create the instance.
 	inst, err := instanceCreateInternal(s, args)
 	if err != nil {
-		return nil, errors.Wrap(err, "Create instance")
+		return nil, errors.Wrap(err, "Failed creating instance record")
 	}
 
-	revert := true
-	defer func() {
-		if !revert {
-			return
-		}
-
-		inst.Delete()
-	}()
+	revert := revert.New()
+	defer revert.Fail()
+	revert.Add(func() { inst.Delete(true) })
 
 	err = s.Cluster.UpdateImageLastUseDate(hash, time.Now().UTC())
 	if err != nil {
@@ -174,27 +171,21 @@ func instanceCreateFromImage(d *Daemon, args db.InstanceArgs, hash string, op *o
 		return nil, errors.Wrap(err, "Create instance from image")
 	}
 
-	// Apply any post-storage configuration.
-	err = instanceConfigureInternal(d.State(), inst)
+	err = inst.UpdateBackupFile()
 	if err != nil {
-		return nil, errors.Wrap(err, "Configure instance")
+		return nil, err
 	}
 
-	revert = false
+	revert.Success()
 	return inst, nil
 }
 
 func instanceCreateAsCopy(s *state.State, args db.InstanceArgs, sourceInst instance.Instance, instanceOnly bool, refresh bool, op *operations.Operation) (instance.Instance, error) {
-	var inst, revertInst instance.Instance
+	var inst instance.Instance
 	var err error
 
-	defer func() {
-		if revertInst == nil {
-			return
-		}
-
-		revertInst.Delete()
-	}()
+	revert := revert.New()
+	defer revert.Fail()
 
 	if refresh {
 		// Load the target instance.
@@ -213,9 +204,10 @@ func instanceCreateAsCopy(s *state.State, args db.InstanceArgs, sourceInst insta
 		// Create the instance.
 		inst, err = instanceCreateInternal(s, args)
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "Failed creating instance record")
 		}
-		revertInst = inst
+
+		revert.Add(func() { inst.Delete(true) })
 	}
 
 	// At this point we have already figured out the parent container's root disk device so we
@@ -240,7 +232,7 @@ func instanceCreateAsCopy(s *state.State, args db.InstanceArgs, sourceInst insta
 
 			// Delete extra snapshots first.
 			for _, snap := range deleteSnapshots {
-				err := snap.Delete()
+				err := snap.Delete(true)
 				if err != nil {
 					return nil, err
 				}
@@ -295,7 +287,7 @@ func instanceCreateAsCopy(s *state.State, args db.InstanceArgs, sourceInst insta
 			// Create the snapshots.
 			snapInst, err := instanceCreateInternal(s, snapInstArgs)
 			if err != nil {
-				return nil, err
+				return nil, errors.Wrapf(err, "Failed creating instance snapshot record %q", newSnapName)
 			}
 
 			// Set snapshot creation date to that of the source snapshot.
@@ -325,23 +317,12 @@ func instanceCreateAsCopy(s *state.State, args db.InstanceArgs, sourceInst insta
 		}
 	}
 
-	// Apply any post-storage configuration.
-	err = instanceConfigureInternal(s, inst)
+	err = inst.UpdateBackupFile()
 	if err != nil {
 		return nil, err
 	}
 
-	if !instanceOnly {
-		for _, snap := range snapList {
-			// Apply any post-storage configuration.
-			err = instanceConfigureInternal(s, *snap)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	revertInst = nil
+	revert.Success()
 	return inst, nil
 }
 
@@ -400,9 +381,9 @@ func instanceCreateAsSnapshot(s *state.State, args db.InstanceArgs, sourceInstan
 	// Create the snapshot.
 	inst, err := instanceCreateInternal(s, args)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "Failed creating instance snapshot record %q", args.Name)
 	}
-	revert.Add(func() { inst.Delete() })
+	revert.Add(func() { inst.Delete(true) })
 
 	pool, err := storagePools.GetPoolByInstance(s, inst)
 	if err != nil {
@@ -415,13 +396,11 @@ func instanceCreateAsSnapshot(s *state.State, args db.InstanceArgs, sourceInstan
 	}
 
 	// Mount volume for backup.yaml writing.
-	ourStart, err := pool.MountInstance(sourceInstance, op)
+	_, err = pool.MountInstance(sourceInstance, op)
 	if err != nil {
 		return nil, errors.Wrap(err, "Create instance snapshot (mount source)")
 	}
-	if ourStart {
-		defer pool.UnmountInstance(sourceInstance, op)
-	}
+	defer pool.UnmountInstance(sourceInstance, op)
 
 	// Attempt to update backup.yaml for instance.
 	err = sourceInstance.UpdateBackupFile()
@@ -433,12 +412,6 @@ func instanceCreateAsSnapshot(s *state.State, args db.InstanceArgs, sourceInstan
 	if args.Stateful {
 		os.RemoveAll(sourceInstance.StatePath())
 	}
-
-	s.Events.SendLifecycle(sourceInstance.Project(), "container-snapshot-created",
-		fmt.Sprintf("/1.0/containers/%s", sourceInstance.Name()),
-		map[string]interface{}{
-			"snapshot_name": args.Name,
-		})
 
 	revert.Success()
 	return inst, nil
@@ -512,7 +485,7 @@ func instanceCreateInternal(s *state.State, args db.InstanceArgs) (instance.Inst
 	checkedProfiles := []string{}
 	for _, profile := range args.Profiles {
 		if !shared.StringInSlice(profile, profiles) {
-			return nil, fmt.Errorf("Requested profile '%s' doesn't exist", profile)
+			return nil, fmt.Errorf("Requested profile %q doesn't exist", profile)
 		}
 
 		if shared.StringInSlice(profile, checkedProfiles) {
@@ -626,7 +599,7 @@ func instanceCreateInternal(s *state.State, args db.InstanceArgs) (instance.Inst
 			if shared.IsSnapshot(args.Name) {
 				thing = "Snapshot"
 			}
-			return nil, fmt.Errorf("%s '%s' already exists", thing, args.Name)
+			return nil, fmt.Errorf("%s %q already exists", thing, args.Name)
 		}
 		return nil, err
 	}
@@ -640,52 +613,18 @@ func instanceCreateInternal(s *state.State, args db.InstanceArgs) (instance.Inst
 		s.Cluster.DeleteInstance(dbInst.Project, dbInst.Name)
 	}()
 
-	// Wipe any existing log for this instance name.
-	os.RemoveAll(shared.LogPath(args.Name))
-
 	args = db.InstanceToArgs(&dbInst)
 	inst, err := instance.Create(s, args)
 	if err != nil {
-		return nil, errors.Wrap(err, "Create instance")
+		logger.Error("Failed initialising instance", log.Ctx{"project": args.Project, "instance": args.Name, "type": args.Type, "err": err})
+		return nil, errors.Wrap(err, "Failed initialising instance")
 	}
+
+	// Wipe any existing log for this instance name.
+	os.RemoveAll(inst.LogPath())
 
 	revert = false
 	return inst, nil
-}
-
-// instanceConfigureInternal applies quota set in volatile "apply_quota" and writes a backup file.
-func instanceConfigureInternal(state *state.State, c instance.Instance) error {
-	// Find the root device.
-	rootDiskDeviceKey, rootDiskDevice, err := shared.GetRootDiskDevice(c.ExpandedDevices().CloneNative())
-	if err != nil {
-		return err
-	}
-
-	pool, err := storagePools.GetPoolByInstance(state, c)
-	if err != nil {
-		return errors.Wrap(err, "Load instance storage pool")
-	}
-
-	if rootDiskDevice["size"] != "" {
-		err = pool.SetInstanceQuota(c, rootDiskDevice["size"], nil)
-
-		// If the storage driver can't set the quota now, store in volatile.
-		if err == storagePools.ErrRunningQuotaResizeNotSupported {
-			err = c.VolatileSet(map[string]string{fmt.Sprintf("volatile.%s.apply_quota", rootDiskDeviceKey): rootDiskDevice["size"]})
-			if err != nil {
-				return err
-			}
-		} else if err != nil {
-			return err
-		}
-	}
-
-	err = c.UpdateBackupFile()
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 // Load all instances of this nodes under the given project.
@@ -925,7 +864,7 @@ func pruneExpiredContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
 func pruneExpiredContainerSnapshots(ctx context.Context, d *Daemon, snapshots []instance.Instance) error {
 	// Find snapshots to delete
 	for _, snapshot := range snapshots {
-		err := snapshot.Delete()
+		err := snapshot.Delete(true)
 		if err != nil {
 			return errors.Wrapf(err, "Failed to delete expired instance snapshot '%s' in project '%s'", snapshot.Name(), snapshot.Project())
 		}
@@ -980,4 +919,39 @@ func containerDetermineNextSnapshotName(d *Daemon, c instance.Instance, defaultP
 	}
 
 	return pattern, nil
+}
+
+var instanceDriversCacheVal atomic.Value
+var instanceDriversCacheLock sync.Mutex
+
+func readInstanceDriversCache() map[string]string {
+	drivers := instanceDriversCacheVal.Load()
+	if drivers == nil {
+		createInstanceDriversCache()
+		drivers = instanceDriversCacheVal.Load()
+	}
+
+	return drivers.(map[string]string)
+}
+
+func createInstanceDriversCache() {
+	// Create the list of instance drivers in use on this LXD instance
+	// namely LXC and QEMU. Given that LXC and QEMU cannot update while
+	// the LXD instance is running, only one cache is ever needed.
+
+	data := map[string]string{}
+
+	info := drivers.SupportedInstanceDrivers()
+	for _, entry := range info {
+		if entry.Version != "" {
+			data[entry.Name] = entry.Version
+		}
+	}
+
+	// Store the value in the cache
+	instanceDriversCacheLock.Lock()
+	instanceDriversCacheVal.Store(data)
+	instanceDriversCacheLock.Unlock()
+
+	return
 }

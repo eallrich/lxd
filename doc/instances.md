@@ -54,7 +54,7 @@ limits.kernel.\*                            | string    | -                 | no
 limits.memory                               | string    | - (all)           | yes           | -                         | Percentage of the host's memory or fixed value in bytes (various suffixes supported, see below)
 limits.memory.enforce                       | string    | hard              | yes           | container                 | If hard, instance can't exceed its memory limit. If soft, the instance can exceed its memory limit when extra host memory is available
 limits.memory.hugepages                     | boolean   | false             | no            | virtual-machine           | Controls whether to back the instance using hugepages rather than regular system memory
-limits.memory.swap                          | boolean   | true              | yes           | container                 | Whether to allow some of the instance's memory to be swapped out to disk
+limits.memory.swap                          | boolean   | true              | yes           | container                 | Controls whether to encourage/discourage swapping less used pages for this instance
 limits.memory.swap.priority                 | integer   | 10 (maximum)      | yes           | container                 | The higher this is set, the least likely the instance is to be swapped to disk (integer between 0 and 10)
 limits.network.priority                     | integer   | 0 (minimum)       | yes           | -                         | When under load, how much priority to give to the instance's network requests (integer between 0 and 10)
 limits.processes                            | integer   | - (max)           | yes           | container                 | Maximum number of processes that can run in the instance
@@ -110,7 +110,7 @@ volatile.idmap.current                      | string    | -             | The id
 volatile.idmap.next                         | string    | -             | The idmap to use next time the instance starts
 volatile.last\_state.idmap                  | string    | -             | Serialized instance uid/gid map
 volatile.last\_state.power                  | string    | -             | Instance state as of last host shutdown
-volatile.vm.uuid                            | string    | -             | Virtual machine UUID
+volatile.uuid                               | string    | -             | Instance UUID
 volatile.\<name\>.apply\_quota              | string    | -             | Disk quota to be applied on next instance start
 volatile.\<name\>.ceph\_rbd                 | string    | -             | RBD device path for Ceph disk devices
 volatile.\<name\>.host\_name                | string    | -             | Network device name on the host
@@ -234,11 +234,12 @@ ID (database)   | Name                               | Condition     | Descripti
 2               | [disk](#type-disk)                 | -             | Mountpoint inside the instance
 3               | [unix-char](#type-unix-char)       | container     | Unix character device
 4               | [unix-block](#type-unix-block)     | container     | Unix block device
-5               | [usb](#type-usb)                   | container     | USB device
-6               | [gpu](#type-gpu)                   | container     | GPU device
+5               | [usb](#type-usb)                   | -             | USB device
+6               | [gpu](#type-gpu)                   | -             | GPU device
 7               | [infiniband](#type-infiniband)     | container     | Infiniband device
 8               | [proxy](#type-proxy)               | container     | Proxy device
 9               | [unix-hotplug](#type-unix-hotplug) | container     | Unix hotplug device
+10              | [tpm](#tpm)                        | -             | TPM device
 
 ### Type: none
 
@@ -320,6 +321,7 @@ maas.subnet.ipv6         | string  | -                 | no       | yes     | MA
 boot.priority            | integer | -                 | no       | no      | Boot priority for VMs (higher boots first)
 vlan                     | integer | -                 | no       | no      | The VLAN ID to use for untagged traffic (Can be `none` to remove port from default VLAN)
 vlan.tagged              | integer | -                 | no       | no      | Comma delimited list of VLAN IDs to join for tagged traffic
+security.port\_isolation | boolean | false             | no       | no      | Prevent the NIC from communicating with other NICs in the network that have port isolation enabled
 
 #### nic: macvlan
 
@@ -341,7 +343,7 @@ hwaddr                  | string  | randomly assigned | no       | no      | TTh
 vlan                    | integer | -                 | no       | no      | TThe VLAN ID to attach to
 maas.subnet.ipv4        | string  | -                 | no       | yes     | MAAS IPv4 subnet to register the instance in
 maas.subnet.ipv6        | string  | -                 | no       | yes     | MAAS IPv6 subnet to register the instance in
-boot.priority           | integer | -                 | no       | no      | TBoot priority for VMs (higher boots first)
+boot.priority           | integer | -                 | no       | no      | Boot priority for VMs (higher boots first)
 
 #### nic: sriov
 
@@ -727,6 +729,9 @@ mode        | int       | 0660              | no        | Mode of the device in 
 required    | boolean   | true              | no        | Whether or not this device is required to start the instance
 
 ### Type: usb
+
+Supported instance types: container, VM
+
 USB device entries simply make the requested USB device appear in the
 instance.
 
@@ -743,10 +748,19 @@ required    | boolean   | false             | no        | Whether or not this de
 
 ### Type: gpu
 
-Supported instance types: container, VM
-
 GPU device entries simply make the requested gpu device appear in the
 instance.
+
+#### GPUs Available:
+
+The following GPUs can be specified using the `gputype` property:
+
+ - [physical](#gpu-physical) Passes through an entire GPU. This is the default if `gputype` is unspecified.
+ - [mdev](#gpu-mdev) Creates and passes through a virtual GPU.
+
+#### gpu: physical
+
+Supported instance types: container, VM
 
 The following properties exist:
 
@@ -760,9 +774,25 @@ uid         | int       | 0                 | no        | UID of the device owne
 gid         | int       | 0                 | no        | GID of the device owner in the instance (container only)
 mode        | int       | 0660              | no        | Mode of the device in the instance (container only)
 
+#### gpu: mdev
+
+Supported instance types: VM
+
+Create a virtual GPU and pass it. A list of available mdev profiles can be found by running `lxc info --resources`.
+
+The following properties exist:
+
+Key         | Type      | Default           | Required  | Description
+:--         | :--       | :--               | :--       | :--
+vendorid    | string    | -                 | no        | The vendor id of the GPU device
+productid   | string    | -                 | no        | The product id of the GPU device
+id          | string    | -                 | no        | The card id of the GPU device
+pci         | string    | -                 | no        | The pci address of the GPU device
+mdev        | string    | -                 | no        | The mdev profile to use (e.g. i915-GVTg_V5_4)
+
 ### Type: proxy
 
-Supported instance types: container
+Supported instance types: container (`nat` and non-`nat` modes), VM (`nat` mode only)
 
 Proxy devices allow forwarding network connections between host and instance.
 This makes it possible to forward traffic hitting one of the host's
@@ -846,6 +876,19 @@ uid         | int       | 0                 | no        | UID of the device owne
 gid         | int       | 0                 | no        | GID of the device owner in the instance
 mode        | int       | 0660              | no        | Mode of the device in the instance
 required    | boolean   | false             | no        | Whether or not this device is required to start the instance. (The default is false, and all devices are hot-pluggable)
+
+
+### Type: tpm
+
+Supported instance types: container, VM
+
+TPM device entries enable access to a TPM emulator.
+
+The following properties exist:
+
+Key                 | Type      | Default   | Required  | Description
+:--                 | :--       | :--       | :--       | :--
+path                | string    | -         | yes       | Path inside the instance (only for containers).
 
 ## Units for storage and network limits
 Any value representing bytes or bits can make use of a number of useful
@@ -979,5 +1022,5 @@ in your template string to avoid forbidden characters in your snapshot name.
 Another way to avoid name collisions is to use the placeholder `%d`. If a snapshot
 with the same name (excluding the placeholder) already exists, all existing snapshot
 names will be taken into account to find the highest number at the placeholders
-position. This numnber will be incremented by one for the new name. The starting
+position. This number will be incremented by one for the new name. The starting
 number if no snapshot exists will be `0`.

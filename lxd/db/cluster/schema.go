@@ -299,10 +299,12 @@ CREATE TABLE "networks_nodes" (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     network_id INTEGER NOT NULL,
     node_id INTEGER NOT NULL,
+    state INTEGER NOT NULL DEFAULT 0,
     UNIQUE (network_id, node_id),
     FOREIGN KEY (network_id) REFERENCES "networks" (id) ON DELETE CASCADE,
     FOREIGN KEY (node_id) REFERENCES nodes (id) ON DELETE CASCADE
 );
+CREATE UNIQUE INDEX networks_unique_network_id_node_id_key ON networks_config (network_id, IFNULL(node_id, -1), key);
 CREATE TABLE nodes (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -489,10 +491,12 @@ CREATE TABLE storage_pools_nodes (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     storage_pool_id INTEGER NOT NULL,
     node_id INTEGER NOT NULL,
+    state INTEGER NOT NULL DEFAULT 0,
     UNIQUE (storage_pool_id, node_id),
     FOREIGN KEY (storage_pool_id) REFERENCES storage_pools (id) ON DELETE CASCADE,
     FOREIGN KEY (node_id) REFERENCES nodes (id) ON DELETE CASCADE
 );
+CREATE UNIQUE INDEX storage_pools_unique_storage_pool_id_node_id_key ON storage_pools_config (storage_pool_id, IFNULL(node_id, -1), key);
 CREATE TABLE "storage_volumes" (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     name TEXT NOT NULL,
@@ -589,5 +593,5 @@ CREATE TABLE storage_volumes_snapshots_config (
     UNIQUE (storage_volume_snapshot_id, key)
 );
 
-INSERT INTO schema (version, updated_at) VALUES (39, strftime("%s"))
+INSERT INTO schema (version, updated_at) VALUES (44, strftime("%s"))
 `

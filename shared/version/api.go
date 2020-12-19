@@ -233,6 +233,18 @@ var APIExtensions = []string{
 	"network_ovn_external_subnets",
 	"network_ovn_nat",
 	"network_ovn_external_routes_remove",
+	"tpm_device_type",
+	"storage_zfs_clone_copy_rebase",
+	"gpu_mdev",
+	"resources_pci_iommu",
+	"resources_network_usb",
+	"resources_disk_address",
+	"network_physical_ovn_ingress_mode",
+	"network_ovn_dhcp",
+	"network_physical_routes_anycast",
+	"projects_limits_instances",
+	"network_state_vlan",
+	"instance_nic_bridged_port_isolation",
 }
 
 // APIExtensionsCount returns the number of available API extensions.

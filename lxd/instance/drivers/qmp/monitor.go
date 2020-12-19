@@ -1,6 +1,7 @@
 package qmp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"github.com/digitalocean/go-qemu/qmp"
 
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/logger"
 )
 
 var monitors = map[string]*Monitor{}
@@ -75,67 +77,81 @@ func Connect(path string, serialCharDev string, eventHandler func(name string, d
 }
 
 func (m *Monitor) run() error {
-	// Start ringbuffer monitoring go routine.
-	go func() {
-		for {
-			// Read the ringbuffer.
-			resp, err := m.qmp.Run([]byte(fmt.Sprintf(`{"execute": "ringbuf-read", "arguments": {"device": "%s", "size": %d, "format": "utf8"}}`, m.serialCharDev, RingbufSize)))
-			if err != nil {
-				m.Disconnect()
-				return
-			}
+	// Ringbuffer monitoring function.
+	checkBuffer := func() {
+		// Read the ringbuffer.
+		resp, err := m.qmp.Run([]byte(fmt.Sprintf(`{"execute": "ringbuf-read", "arguments": {"device": "%s", "size": %d, "format": "utf8"}}`, m.serialCharDev, RingbufSize)))
+		if err != nil {
+			// Failure to send a command, assume disconnected/crashed.
+			m.Disconnect()
+			return
+		}
 
-			// Decode the response.
-			var respDecoded struct {
-				Return string `json:"return"`
-			}
+		// Decode the response.
+		var respDecoded struct {
+			Return string `json:"return"`
+		}
 
-			err = json.Unmarshal(resp, &respDecoded)
-			if err != nil {
-				continue
-			}
+		err = json.Unmarshal(resp, &respDecoded)
+		if err != nil {
+			// Received bad data, assume disconnected/crashed.
+			m.Disconnect()
+			return
+		}
 
-			// Extract the last entry.
-			entries := strings.Split(respDecoded.Return, "\n")
-			if len(entries) > 1 {
-				status := entries[len(entries)-2]
+		// Extract the last entry.
+		entries := strings.Split(respDecoded.Return, "\n")
+		if len(entries) > 1 {
+			status := entries[len(entries)-2]
 
-				if status == "STARTED" {
-					m.agentReady = true
-				} else if status == "STOPPED" {
-					m.agentReady = false
-				}
-			}
-
-			// Wait until next read or cancel.
-			select {
-			case <-m.chDisconnect:
-				return
-			case <-time.After(10 * time.Second):
-				continue
+			if status == "STARTED" {
+				m.agentReady = true
+			} else if status == "STOPPED" {
+				m.agentReady = false
 			}
 		}
-	}()
+	}
 
 	// Start event monitoring go routine.
-	chEvents, err := m.qmp.Events()
+	chEvents, err := m.qmp.Events(context.Background())
 	if err != nil {
 		return err
 	}
 
 	go func() {
+		// Initial read from the ringbuffer.
+		go checkBuffer()
+
 		for {
+			// Wait for an event, disconnection or timeout.
 			select {
 			case <-m.chDisconnect:
 				return
-			case e := <-chEvents:
+			case e, more := <-chEvents:
+				// Deliver non-empty events to the event handler.
+				if m.eventHandler != nil && e.Event != "" {
+					go m.eventHandler(e.Event, e.Data)
+				}
+
+				// Event channel is closed, lets disconnect.
+				if !more {
+					m.Disconnect()
+					return
+				}
+
 				if e.Event == "" {
+					logger.Warnf("Unexpected empty event received from qmp event channel")
+					time.Sleep(time.Second) // Don't spin if we receive a lot of these.
 					continue
 				}
 
-				if m.eventHandler != nil {
-					m.eventHandler(e.Event, e.Data)
-				}
+				// Check if the ringbuffer was updated (non-blocking).
+				go checkBuffer()
+			case <-time.After(10 * time.Second):
+				// Check if the ringbuffer was updated (non-blocking).
+				go checkBuffer()
+
+				continue
 			}
 		}
 	}()

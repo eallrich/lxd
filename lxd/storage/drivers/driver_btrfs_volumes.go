@@ -68,7 +68,14 @@ func (d *btrfs) CreateVolume(vol Volume, filler *VolumeFiller, op *operations.Op
 			return err
 		}
 
-		_, err = ensureVolumeBlockFile(rootBlockPath, sizeBytes)
+		// Allow unsafe resize of image volumes as filler won't have been able to resize the volume to the
+		// target size as volume file didn't exist then (and we can't create in advance because qemu-img
+		// truncates the file to image size).
+		if vol.volType == VolumeTypeImage {
+			vol.allowUnsafeResize = true
+		}
+
+		_, err = ensureVolumeBlockFile(vol, rootBlockPath, sizeBytes)
 
 		// Ignore ErrCannotBeShrunk as this just means the filler has needed to increase the volume size.
 		if err != nil && errors.Cause(err) != ErrCannotBeShrunk {
@@ -547,6 +554,14 @@ func (d *btrfs) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, v
 		}
 	}
 
+	if vol.contentType == ContentTypeFS {
+		// Apply the size limit.
+		err = d.SetVolumeQuota(vol, vol.ConfigSize(), op)
+		if err != nil {
+			return err
+		}
+	}
+
 	revert.Success()
 	return nil
 }
@@ -603,12 +618,9 @@ func (d *btrfs) ValidateVolume(vol Volume, removeUnknownKeys bool) error {
 
 // UpdateVolume applies config changes to the volume.
 func (d *btrfs) UpdateVolume(vol Volume, changedConfig map[string]string) error {
-	if vol.volType != VolumeTypeCustom {
-		return ErrNotSupported
-	}
-
-	if _, changed := changedConfig["size"]; changed {
-		err := d.SetVolumeQuota(vol, changedConfig["size"], nil)
+	newSize, sizeChanged := changedConfig["size"]
+	if sizeChanged {
+		err := d.SetVolumeQuota(vol, newSize, nil)
 		if err != nil {
 			return err
 		}
@@ -653,7 +665,7 @@ func (d *btrfs) SetVolumeQuota(vol Volume, size string, op *operations.Operation
 			return err
 		}
 
-		resized, err := ensureVolumeBlockFile(rootBlockPath, sizeBytes)
+		resized, err := ensureVolumeBlockFile(vol, rootBlockPath, sizeBytes)
 		if err != nil {
 			return err
 		}
@@ -755,23 +767,31 @@ func (d *btrfs) GetVolumeDiskPath(vol Volume) (string, error) {
 	return genericVFSGetVolumeDiskPath(vol)
 }
 
-// MountVolume simulates mounting a volume. As the driver doesn't have volumes to mount it returns
-// false indicating that there is no need to issue an unmount.
-func (d *btrfs) MountVolume(vol Volume, op *operations.Operation) (bool, error) {
+// MountVolume simulates mounting a volume.
+func (d *btrfs) MountVolume(vol Volume, op *operations.Operation) error {
+	unlock := vol.MountLock()
+	defer unlock()
+
 	// Don't attempt to modify the permission of an existing custom volume root.
 	// A user inside the instance may have modified this and we don't want to reset it on restart.
 	if !shared.PathExists(vol.MountPath()) || vol.volType != VolumeTypeCustom {
 		err := vol.EnsureMountPath()
 		if err != nil {
-			return false, err
+			return err
 		}
 	}
 
-	return false, nil
+	vol.MountRefCountIncrement() // From here on it is up to caller to call UnmountVolume() when done.
+	return nil
 }
 
 // UnmountVolume simulates unmounting a volume.
-func (d *btrfs) UnmountVolume(vol Volume, op *operations.Operation) (bool, error) {
+// As driver doesn't have volumes to unmount it returns false indicating the volume was already unmounted.
+func (d *btrfs) UnmountVolume(vol Volume, keepBlockDev bool, op *operations.Operation) (bool, error) {
+	unlock := vol.MountLock()
+	defer unlock()
+
+	vol.MountRefCountDecrement()
 	return false, nil
 }
 
@@ -1275,6 +1295,9 @@ func (d *btrfs) DeleteVolumeSnapshot(snapVol Volume, op *operations.Operation) e
 
 // MountVolumeSnapshot sets up a read-only mount on top of the snapshot to avoid accidental modifications.
 func (d *btrfs) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) (bool, error) {
+	unlock := snapVol.MountLock()
+	defer unlock()
+
 	snapPath := snapVol.MountPath()
 
 	// Don't attempt to modify the permission of an existing custom volume root.
@@ -1291,6 +1314,9 @@ func (d *btrfs) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) (b
 
 // UnmountVolumeSnapshot removes the read-only mount placed on top of a snapshot.
 func (d *btrfs) UnmountVolumeSnapshot(snapVol Volume, op *operations.Operation) (bool, error) {
+	unlock := snapVol.MountLock()
+	defer unlock()
+
 	snapPath := snapVol.MountPath()
 	return forceUnmount(snapPath)
 }
